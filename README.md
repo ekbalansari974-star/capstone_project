@@ -464,3 +464,189 @@ print("\n[Task 9] Summary table:\n", summary_df.to_markdown(index=False))
 # usually the model with the best mean CV AUC *and* an acceptably low std.
 
 print("\nALL PART 3 TASKS COMPLETE")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import re
+import json
+import requests
+import joblib
+import pandas as pd
+from jsonschema import validate, ValidationError
+
+# ============================================================
+# Task 1 — LLM API connection
+# ============================================================
+LLM_API_KEY = os.environ['LLM_API_KEY']   # set this in your shell/.env before running
+MODEL_NAME = "openai/gpt-4o-mini"          # any OpenRouter-supported model works
+
+def call_llm(system_prompt, user_prompt, temperature=0.0, max_tokens=512):
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_code != 200:
+        print(f"LLM call failed with status {response.status_code}")
+        return None
+    data = response.json()
+    return data["choices"][0]["message"]["content"]
+
+# Demonstration call
+print("Test call:", call_llm("You are a test bot.", "Reply with only the word: hello", temperature=0.0))
+
+
+# ============================================================
+# Task 2 — Prompt design
+# ============================================================
+SYSTEM_PROMPT = (
+    "You are a structured explanation assistant for a bank marketing prediction model. "
+    "Given a customer's feature values, the model's predicted class, and predicted "
+    "probability, you explain the prediction in concise, structured JSON. "
+    "Output only valid JSON, with no extra commentary."
+)
+
+def build_user_prompt(feature_values: dict, predicted_class: int, predicted_proba: float) -> str:
+    return f"""Feature values: {json.dumps(feature_values)}
+Predicted class: {predicted_class}
+Predicted probability: {predicted_proba:.4f}
+
+Return ONLY a JSON object with exactly these keys:
+{{
+  "prediction_label": "yes" or "no",
+  "confidence_level": "low", "medium", or "high",
+  "top_reason": "<one short sentence>",
+  "next_step": "<one short recommended action>",
+  "summary": "<one short sentence summarizing the explanation>"
+}}"""
+# README: zero-shot prompt at temperature=0 -- reproducibility matters more than
+# creativity here, since the same customer record should get the same explanation
+# on re-run. The schema (not worked examples) constrains the output shape.
+
+
+# ============================================================
+# Task 3 — Structured output handling
+# ============================================================
+model = joblib.load('best_model.pkl')   # trained pipeline from Part 3
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "prediction_label": {"type": "string", "enum": ["yes", "no"]},
+        "confidence_level": {"type": "string", "enum": ["low", "medium", "high"]},
+        "top_reason": {"type": "string"},
+        "next_step": {"type": "string"},
+        "summary": {"type": "string"},
+    },
+    "required": ["prediction_label", "confidence_level", "top_reason", "next_step", "summary"]
+}
+FALLBACK = {k: None for k in SCHEMA["properties"]}
+
+def get_explanation(feature_values, predicted_class, predicted_proba):
+    user_prompt = build_user_prompt(feature_values, predicted_class, predicted_proba)
+    raw_response = call_llm(SYSTEM_PROMPT, user_prompt, temperature=0.0)
+
+    if raw_response is None:
+        print("LLM call returned None; using fallback.")
+        return FALLBACK, "call_failed"
+
+    try:
+        cleaned = raw_response.strip()
+        parsed = json.loads(cleaned)
+        validate(instance=parsed, schema=SCHEMA)
+        return parsed, "valid"
+    except (json.JSONDecodeError, ValidationError) as e:
+        print(f"Validation error: {e}")
+        return FALLBACK, "invalid"
+
+
+# ============================================================
+# Task 4 — Guardrails (PII check before every LLM call)
+# ============================================================
+def has_pii(text: str) -> bool:
+    email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
+    phone_pattern = r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b'
+    return bool(re.search(email_pattern, text) or re.search(phone_pattern, text))
+
+def safe_get_explanation(feature_values, predicted_class, predicted_proba):
+    probe_text = json.dumps(feature_values)
+    if has_pii(probe_text):
+        print("Input blocked: PII detected")
+        return FALLBACK, "blocked_pii"
+    return get_explanation(feature_values, predicted_class, predicted_proba)
+
+# Guardrail demonstration -- one blocked, one allowed
+clean_example = {"job": "technician", "age": 35}
+pii_example = {"job": "technician", "note": "contact me at jane.doe@example.com"}
+print("\n[Guardrail] clean input -> has_pii:", has_pii(json.dumps(clean_example)))   # False
+print("[Guardrail] PII input   -> has_pii:", has_pii(json.dumps(pii_example)))       # True
+
+
+# ============================================================
+# Task 5 — End-to-end demonstration on 3 records
+# ============================================================
+# X_enc (encoded features, matches model input) and X (raw feature values, for the
+# prompt) must already exist from your Part 2/3 preprocessing code.
+model_features = model.feature_names_in_
+X_enc_aligned = X_enc.reindex(columns=model_features, fill_value=0)
+
+test_records = X_enc_aligned.sample(3, random_state=42)
+raw_records = X.loc[test_records.index]
+
+results = []
+for idx in test_records.index:
+    feature_row = test_records.loc[[idx]]
+    predicted_class = int(model.predict(feature_row)[0])
+    predicted_proba = float(model.predict_proba(feature_row)[0, 1])
+    feature_values = raw_records.loc[idx].to_dict()
+
+    explanation, status = safe_get_explanation(feature_values, predicted_class, predicted_proba)
+
+    print(f"\n--- Record ---")
+    print("Input:", feature_values)
+    print(f"Predicted class: {predicted_class} | Predicted probability: {predicted_proba:.4f}")
+    print("LLM explanation:", explanation)
+    print("Validation status:", status)
+
+    results.append({
+        "Feature Values": feature_values,
+        "Predicted Probability": round(predicted_proba, 4),
+        "Explanation": explanation.get("summary"),
+        "Validation Status": status
+    })
+
+results_df = pd.DataFrame(results)
+print("\n[README table]\n", results_df.to_markdown(index=False))
+
+print("\nALL PART 4 (TRACK C) TASKS COMPLETE")
